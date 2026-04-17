@@ -150,6 +150,13 @@ On macOS, install PDF tooling with:
 brew install poppler
 ```
 
+Linux (Debian/Ubuntu)
+
+```bash
+sudo apt update
+sudo apt install -y poppler-utils
+```
+
 ## Configuration
 
 Required:
