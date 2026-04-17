@@ -1,0 +1,223 @@
+version: "3.9"
+
+x-seaweedfs-common: &seaweedfs-common
+  image: chrislusf/seaweedfs:4.19
+  networks:
+    - sw
+
+x-master-common: &master-common
+  <<: *seaweedfs-common
+  command: >
+    master
+    -ip.bind=0.0.0.0
+    -mdir=/data
+    -port=9333
+    -peers=master1:9333,master2:9333,master3:9333
+    -defaultReplication=020
+
+x-volume-common: &volume-common
+  <<: *seaweedfs-common
+  command: >
+    volume
+    -ip.bind=0.0.0.0
+    -max=0
+    -mserver=master1:9333,master2:9333,master3:9333
+    -port=8080
+    -dataCenter=dc1
+  depends_on:
+    - master1
+    - master2
+    - master3
+
+services:
+  master1:
+    <<: *master-common
+    container_name: master1
+    hostname: master1
+    command: >
+      master
+      -ip=master1
+      -ip.bind=0.0.0.0
+      -mdir=/data
+      -port=9333
+      -peers=master1:9333,master2:9333,master3:9333
+      -defaultReplication=020
+    ports:
+      - "9333:9333"
+      - "19333:19333"
+    volumes:
+      - ./data/master1:/data
+
+  master2:
+    <<: *master-common
+    container_name: master2
+    hostname: master2
+    command: >
+      master
+      -ip=master2
+      -ip.bind=0.0.0.0
+      -mdir=/data
+      -port=9333
+      -peers=master1:9333,master2:9333,master3:9333
+      -defaultReplication=020
+    ports:
+      - "9334:9333"
+      - "19334:19333"
+    volumes:
+      - ./data/master2:/data
+
+  master3:
+    <<: *master-common
+    container_name: master3
+    hostname: master3
+    command: >
+      master
+      -ip=master3
+      -ip.bind=0.0.0.0
+      -mdir=/data
+      -port=9333
+      -peers=master1:9333,master2:9333,master3:9333
+      -defaultReplication=020
+    ports:
+      - "9335:9333"
+      - "19335:19333"
+    volumes:
+      - ./data/master3:/data
+
+  volume1:
+    <<: *volume-common
+    container_name: volume1
+    hostname: volume1
+    command: >
+      volume
+      -ip=volume1
+      -ip.bind=0.0.0.0
+      -dir=/data1,/data2
+      -max=0
+      -mserver=master1:9333,master2:9333,master3:9333
+      -port=8080
+      -dataCenter=dc1
+      -rack=rack1
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./data/volume1:/data1
+      - ./data/volume1-2:/data2
+
+  volume2:
+    <<: *volume-common
+    container_name: volume2
+    hostname: volume2
+    command: >
+      volume
+      -ip=volume2
+      -ip.bind=0.0.0.0
+      -dir=/data
+      -max=0
+      -mserver=master1:9333,master2:9333,master3:9333
+      -port=8080
+      -dataCenter=dc1
+      -rack=rack2
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./data/volume2:/data
+
+  volume3:
+    <<: *volume-common
+    container_name: volume3
+    hostname: volume3
+    command: >
+      volume
+      -ip=volume3
+      -ip.bind=0.0.0.0
+      -dir=/data
+      -max=0
+      -mserver=master1:9333,master2:9333,master3:9333
+      -port=8080
+      -dataCenter=dc1
+      -rack=rack3
+    ports:
+      - "8083:8080"
+    volumes:
+      - ./data/volume3:/data
+
+  volume4:
+    <<: *volume-common
+    container_name: volume4
+    hostname: volume4
+    command: >
+      volume
+      -ip=volume4
+      -ip.bind=0.0.0.0
+      -dir=/data
+      -max=0
+      -mserver=master1:9333,master2:9333,master3:9333
+      -port=8080
+      -dataCenter=dc1
+      -rack=rack4
+    ports:
+      - "8084:8080"
+    volumes:
+      - ./data/volume4:/data
+
+  filer:
+    <<: *seaweedfs-common
+    container_name: filer
+    hostname: filer
+    command: >
+      filer
+      -ip=filer
+      -ip.bind=0.0.0.0
+      -master=master1:9333,master2:9333,master3:9333
+      -port=8888
+    ports:
+      - "8888:8888"
+      - "18888:18888"
+    volumes:
+      - ./data/filer:/data
+    depends_on:
+      - volume1
+      - volume2
+      - volume3
+      - volume4
+
+  s3:
+    <<: *seaweedfs-common
+    container_name: s3
+    hostname: s3
+    command: >
+      s3
+      -filer=filer:8888
+      -ip.bind=0.0.0.0
+      -port=8333
+    ports:
+      - "8333:8333"
+    depends_on:
+      - filer
+  admin:
+    <<: *seaweedfs-common
+    container_name: admin
+    hostname: admin
+    command: >
+      server
+      -ip=admin
+      -ip.bind=0.0.0.0
+      -master=master1:9333,master2:9333,master3:9333
+      -filer=filer:8888
+      -volume.port=8080
+      -dir=/data
+      -s3
+      -s3.port=8333
+      -admin.port=23646
+    ports:
+      - "23646:23646"
+    depends_on:
+      - master1
+      - master2
+      - master3
+      - filer
+
+networks:
+  sw:
+    driver: bridge

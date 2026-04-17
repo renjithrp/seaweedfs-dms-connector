@@ -1,0 +1,399 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/renjithrp/dms-seaweedfs-connector/internal/config"
+	"github.com/renjithrp/dms-seaweedfs-connector/internal/metrics"
+	"github.com/renjithrp/dms-seaweedfs-connector/internal/seaweed"
+	"github.com/renjithrp/dms-seaweedfs-connector/internal/util"
+)
+
+type Handler struct {
+	cfg     config.Config
+	client  *seaweed.Client
+	idGen   *util.IDGenerator
+	metrics *metrics.Registry
+}
+
+func New(cfg config.Config, client *seaweed.Client, idGen *util.IDGenerator, m *metrics.Registry) *Handler {
+	return &Handler{cfg: cfg, client: client, idGen: idGen, metrics: m}
+}
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	rw := &statusWriter{ResponseWriter: w, status: 200}
+	endpoint := "unknown"
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/dss/api/ping":
+		endpoint = "ping"
+		if err := h.client.Health(r.Context()); err != nil {
+			h.metrics.IncPingFailure()
+			h.metrics.IncSeaweedConnectionFail()
+			writeJSON(rw, http.StatusServiceUnavailable, map[string]any{"status": "error", "message": err.Error()})
+		} else if err := h.idGen.HealthError(); err != nil {
+			h.metrics.IncPingFailure()
+			writeJSON(rw, http.StatusServiceUnavailable, map[string]any{"status": "error", "message": err.Error()})
+		} else {
+			h.metrics.IncPingSuccess()
+			writeJSON(rw, http.StatusOK, map[string]any{"status": "ok"})
+		}
+	case r.Method == http.MethodGet && r.URL.Path == "/metrics":
+		endpoint = "metrics"
+		rw.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = io.WriteString(rw, h.metrics.Render())
+	case r.Method == http.MethodGet && r.URL.Path == "/healthz":
+		endpoint = "healthz"
+		writeJSON(rw, http.StatusOK, map[string]any{"status": "ok"})
+	case r.Method == http.MethodGet && r.URL.Path == "/readyz":
+		endpoint = "readyz"
+		if err := h.client.Health(r.Context()); err != nil {
+			writeJSON(rw, http.StatusServiceUnavailable, map[string]any{"status": "error", "message": err.Error()})
+		} else {
+			writeJSON(rw, http.StatusOK, map[string]any{"status": "ready"})
+		}
+	case matchMethods(r.Method, http.MethodGet, http.MethodPost, http.MethodPut) && strings.HasPrefix(r.URL.Path, "/dss/api/put/"):
+		endpoint = "put"
+		h.uploadBinaryData(rw, r, strings.TrimPrefix(r.URL.Path, "/dss/api/put/"))
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/dss/api/stats/"):
+		endpoint = "stats"
+		h.stats(rw, r, strings.TrimPrefix(r.URL.Path, "/dss/api/stats/"))
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/dss/api/getimage/"):
+		endpoint = "getimage"
+		rest := strings.TrimPrefix(r.URL.Path, "/dss/api/getimage/")
+		p := strings.Split(rest, "/")
+		if len(p) != 2 {
+			writeJSON(rw, http.StatusBadRequest, map[string]any{"error": true, "message": "invalid getimage path"})
+		} else if page, err := strconv.Atoi(p[1]); err != nil {
+			writeJSON(rw, http.StatusBadRequest, map[string]any{"error": true, "message": "invalid page number"})
+		} else {
+			h.getContentPreview(rw, r, p[0], page)
+		}
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/dss/api/get/"):
+		endpoint = "get"
+		h.getBinary(rw, r, strings.TrimPrefix(r.URL.Path, "/dss/api/get/"))
+	default:
+		http.NotFound(rw, r)
+	}
+	h.metrics.Observe(endpoint, r.Method, rw.status, time.Since(start).Seconds())
+}
+func matchMethods(got string, methods ...string) bool {
+	for _, m := range methods {
+		if got == m {
+			return true
+		}
+	}
+	return false
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) { w.status = code; w.ResponseWriter.WriteHeader(code) }
+func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenantID string) {
+	if err := r.ParseMultipartForm(h.cfg.MaxUploadBytes); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "The provided data does not match the expected format"})
+		return
+	}
+	f, fh, err := r.FormFile("bin")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "The provided data does not match the expected format"})
+		return
+	}
+	defer f.Close()
+
+	localPath, size, err := h.stageUploadFile(f)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "The provided data does not match the expected format"})
+		return
+	}
+	defer os.Remove(localPath)
+
+	fileID, err := h.idGen.Generate()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": true, "errorCode": 1, "message": err.Error()})
+		return
+	}
+
+	contentType := fh.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = detectContentTypeFromFile(localPath)
+	}
+	storagePath := h.binaryPath(fileID)
+
+	_, err = h.client.UploadFile(r.Context(), storagePath, "file", fh.Filename, localPath)
+	if err != nil {
+		h.metrics.IncSeaweedConnectionFail()
+		h.metrics.IncSeaweedUploadFail(h.bucketName())
+		h.metrics.IncFileUploadFail(h.bucketName(), fileID)
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "errorCode": 2, "message": err.Error(), "data": map[string]any{"cid": fileID}})
+		return
+	}
+	h.metrics.IncSeaweedUploadSuccess(h.bucketName())
+
+	meta := seaweed.FileMeta{FileID: fileID, TenantID: tenantID, StoragePath: storagePath, Size: size, ContentType: contentType, UploadedAt: time.Now().UTC(), Tags: map[string]string{"tenant_id": tenantID, "original_filename": fh.Filename}}
+
+	if err := h.client.UploadJSON(r.Context(), h.metaPath(fileID), meta); err != nil {
+		h.metrics.IncSeaweedConnectionFail()
+		h.metrics.IncSeaweedUploadFail(h.bucketName())
+		h.metrics.IncFileUploadFail(h.bucketName(), fileID)
+		payload := map[string]any{"error": true, "errorCode": 3, "message": err.Error(), "data": map[string]any{"cid": fileID}}
+		if failedPath, moveErr := h.moveBinaryToFailed(r.Context(), fileID, fh.Filename, localPath); moveErr == nil {
+			payload["data"].(map[string]any)["failed_path"] = failedPath
+		} else {
+			payload["data"].(map[string]any)["move_failed_error"] = moveErr.Error()
+		}
+		writeJSON(w, http.StatusBadGateway, payload)
+		return
+	}
+	h.metrics.IncSeaweedUploadSuccess(h.bucketName())
+	h.metrics.IncFileUploadSuccess(h.bucketName())
+	writeJSON(w, http.StatusOK, map[string]any{"error": false, "errorCode": 0, "data": map[string]any{"cid": fileID}})
+}
+
+func (h *Handler) stageUploadFile(src io.Reader) (string, int64, error) {
+	tmpFile, err := os.CreateTemp(h.cfg.TempDir, "dms-upload-*")
+	if err != nil {
+		return "", 0, err
+	}
+
+	size, copyErr := io.Copy(tmpFile, src)
+	closeErr := tmpFile.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmpFile.Name())
+		return "", 0, copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpFile.Name())
+		return "", 0, closeErr
+	}
+
+	return tmpFile.Name(), size, nil
+}
+
+func detectContentTypeFromFile(localPath string) string {
+	file, err := os.Open(localPath)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	header := make([]byte, 512)
+	n, err := file.Read(header)
+	if err != nil && err != io.EOF {
+		return ""
+	}
+
+	return http.DetectContentType(header[:n])
+}
+
+func (h *Handler) stats(w http.ResponseWriter, r *http.Request, fileID string) {
+	meta, err := h.readMeta(r.Context(), fileID)
+	if err != nil {
+		h.metrics.IncSeaweedConnectionFail()
+		h.metrics.IncGetStatsFail(h.bucketName(), fileID)
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": true, "message": err.Error()})
+		return
+	}
+	h.metrics.IncGetStatsSuccess(h.bucketName())
+	writeJSON(w, http.StatusOK, map[string]any{"error": false, "data": meta})
+}
+func (h *Handler) getBinary(w http.ResponseWriter, r *http.Request, fileID string) {
+	meta, err := h.readMeta(r.Context(), fileID)
+	if err != nil {
+		h.metrics.IncSeaweedConnectionFail()
+		h.metrics.IncFileDownloadFail(h.bucketName(), fileID)
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": true, "message": err.Error()})
+		return
+	}
+	resp, err := h.client.Download(r.Context(), meta.StoragePath)
+	if err != nil {
+		h.metrics.IncSeaweedConnectionFail()
+		h.metrics.IncSeaweedGetStreamFail(h.bucketName(), meta.StoragePath)
+		h.metrics.IncFileDownloadFail(h.bucketName(), fileID)
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
+	h.metrics.IncFileDownloadSuccess(h.bucketName())
+	if meta.ContentType != "" {
+		w.Header().Set("Content-Type", meta.ContentType)
+	}
+	filename := fileID + extensionFromContentType(meta.ContentType)
+	if o := meta.Tags["original_filename"]; o != "" {
+		filename = o
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", filename))
+	if meta.Size > 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
+	}
+	_, _ = io.Copy(w, resp.Body)
+}
+func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, fileID string, page int) {
+	scale := 1.0
+	if v := r.URL.Query().Get("scale"); v != "" {
+		if p, err := strconv.ParseFloat(v, 64); err == nil {
+			scale = p
+		}
+	}
+	if scale > 2 {
+		scale = 2
+	}
+	if scale <= 0 {
+		scale = 1
+	}
+	meta, err := h.readMeta(r.Context(), fileID)
+	if err != nil {
+		h.metrics.IncSeaweedConnectionFail()
+		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": true, "message": err.Error()})
+		return
+	}
+	if strings.HasPrefix(strings.ToLower(meta.ContentType), "image/") {
+		resp, err := h.client.Download(r.Context(), meta.StoragePath)
+		if err != nil {
+			h.metrics.IncSeaweedConnectionFail()
+			h.metrics.IncSeaweedGetStreamFail(h.bucketName(), meta.StoragePath)
+			h.metrics.IncFileDownloadFail(h.bucketName(), fileID)
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
+		h.metrics.IncFileDownloadSuccess(h.bucketName())
+		w.Header().Set("Content-Type", meta.ContentType)
+		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", fileID+extensionFromContentType(meta.ContentType)))
+		if meta.Size > 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
+		}
+		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+	if !strings.Contains(strings.ToLower(meta.ContentType), "pdf") {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": true, "message": "preview only supported for PDF or image content"})
+		return
+	}
+	cachePath := h.previewCachePath(fileID, page)
+	if resp, err := h.client.Download(r.Context(), cachePath); err == nil {
+		defer resp.Body.Close()
+		h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
+		h.metrics.IncPDFImageSuccess(h.bucketName())
+		if size := resp.ContentLength; size > 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(cachePath)))
+		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+	tmpDir, err := os.MkdirTemp(h.cfg.TempDir, "dms-preview-")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": true, "message": err.Error()})
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+	pdfPath := filepath.Join(tmpDir, fileID+".pdf")
+	if err := h.client.DownloadToFile(r.Context(), meta.StoragePath, pdfPath); err != nil {
+		h.metrics.IncSeaweedConnectionFail()
+		h.metrics.IncSeaweedGetStreamFail(h.bucketName(), meta.StoragePath)
+		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
+		return
+	}
+	h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
+	prefix := filepath.Join(tmpDir, "preview")
+	dpi := int(float64(h.cfg.PDFFallbackDPI) * scale)
+	cmd := exec.CommandContext(context.Background(), "pdftoppm", "-png", "-f", strconv.Itoa(page), "-singlefile", "-r", strconv.Itoa(dpi), pdfPath, prefix)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": strings.TrimSpace(stderr.String())})
+		return
+	}
+	pngPath := prefix + ".png"
+	pngBytes, err := os.ReadFile(pngPath)
+	if err != nil {
+		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
+		return
+	}
+	h.metrics.IncPDFImageSuccess(h.bucketName())
+	go func(cachePath string, payload []byte) {
+		_, _ = h.client.UploadBytes(context.Background(), cachePath, "file", path.Base(cachePath), payload)
+	}(cachePath, append([]byte(nil), pngBytes...))
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Content-Length", strconv.Itoa(len(pngBytes)))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(cachePath)))
+	_, _ = w.Write(pngBytes)
+}
+func (h *Handler) readMeta(ctx context.Context, fileID string) (seaweed.FileMeta, error) {
+	var meta seaweed.FileMeta
+	if err := h.client.ReadJSON(ctx, h.metaPath(fileID), &meta); err != nil {
+		return meta, err
+	}
+	return meta, nil
+}
+
+func (h *Handler) moveBinaryToFailed(ctx context.Context, fileID, fileName, localPath string) (string, error) {
+	failedPath := h.failedBinaryPath(fileID, fileName)
+	if _, err := h.client.UploadFile(ctx, failedPath, "file", path.Base(failedPath), localPath); err != nil {
+		return "", fmt.Errorf("upload failed copy: %w", err)
+	}
+	if err := h.client.Delete(ctx, h.binaryPath(fileID)); err != nil {
+		return "", fmt.Errorf("delete original after failed copy: %w", err)
+	}
+	return failedPath, nil
+}
+
+func (h *Handler) binaryPath(fileID string) string {
+	return path.Join(h.cfg.InternalRoot, "data", fileID)
+}
+
+func (h *Handler) failedBinaryPath(fileID, fileName string) string {
+	name := fileID
+	if trimmed := path.Base(strings.TrimSpace(fileName)); trimmed != "" && trimmed != "." && trimmed != "/" {
+		name = fileID + "__" + trimmed
+	}
+	return path.Join(h.cfg.InternalRoot, "failed", name)
+}
+
+func (h *Handler) metaPath(fileID string) string {
+	return path.Join(h.cfg.InternalRoot, "meta", fileID+".json")
+}
+func (h *Handler) previewCachePath(fileID string, page int) string {
+	return path.Join(h.cfg.InternalRoot, "images", fmt.Sprintf("%s_page_%d.png", fileID, page))
+}
+func (h *Handler) bucketName() string {
+	return h.cfg.InternalRoot
+}
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+func extensionFromContentType(contentType string) string {
+	if contentType == "" {
+		return ""
+	}
+	exts, err := mime.ExtensionsByType(contentType)
+	if err != nil || len(exts) == 0 {
+		return ""
+	}
+	return exts[0]
+}
