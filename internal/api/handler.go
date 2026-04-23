@@ -33,6 +33,10 @@ func New(cfg config.Config, client *seaweed.Client, idGen *util.IDGenerator, m *
 	return &Handler{cfg: cfg, client: client, idGen: idGen, metrics: m}
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+
+	fmt.Println("🔥 SEAWEEDFS HIT")
+	fmt.Println(r)
+
 	start := time.Now()
 	rw := &statusWriter{ResponseWriter: w, status: 200}
 	endpoint := "unknown"
@@ -70,17 +74,42 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/dss/api/stats/"):
 		endpoint = "stats"
 		h.stats(rw, r, strings.TrimPrefix(r.URL.Path, "/dss/api/stats/"))
+
+	// case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/dss/api/getimage/"):
+	// 	endpoint = "getimage"
+	// 	rest := strings.TrimPrefix(r.URL.Path, "/dss/api/getimage/")
+	// 	p := strings.Split(rest, "/")
+	// 	if len(p) != 2 {
+	// 		writeJSON(rw, http.StatusBadRequest, map[string]any{"error": true, "message": "invalid getimage path"})
+	// 	} else if page, err := strconv.Atoi(p[1]); err != nil {
+	// 		writeJSON(rw, http.StatusBadRequest, map[string]any{"error": true, "message": "invalid page number"})
+	// 	} else {
+	// 		h.getContentPreview(rw, r, p[0], page)
+	// 	}
+
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/dss/api/getimage/"):
 		endpoint = "getimage"
+
 		rest := strings.TrimPrefix(r.URL.Path, "/dss/api/getimage/")
 		p := strings.Split(rest, "/")
-		if len(p) != 2 {
-			writeJSON(rw, http.StatusBadRequest, map[string]any{"error": true, "message": "invalid getimage path"})
-		} else if page, err := strconv.Atoi(p[1]); err != nil {
-			writeJSON(rw, http.StatusBadRequest, map[string]any{"error": true, "message": "invalid page number"})
-		} else {
-			h.getContentPreview(rw, r, p[0], page)
+
+		fileID := p[0]
+
+		pageStr := r.URL.Query().Get("page")
+		if pageStr == "" && len(p) > 1 {
+			pageStr = strings.Split(p[1], "?")[0]
 		}
+		if pageStr == "" {
+			pageStr = "1" // default fallback
+		}
+
+		page, err := strconv.Atoi(pageStr)
+		if err != nil {
+			page = 1 // fallback
+		}
+
+		h.getContentPreview(rw, r, fileID, page)
+
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/dss/api/get/"):
 		endpoint = "get"
 		h.getBinary(rw, r, strings.TrimPrefix(r.URL.Path, "/dss/api/get/"))
@@ -202,7 +231,9 @@ func detectContentTypeFromFile(localPath string) string {
 }
 
 func (h *Handler) stats(w http.ResponseWriter, r *http.Request, fileID string) {
+	//_, err := h.readMeta(r.Context(), fileID)
 	meta, err := h.readMeta(r.Context(), fileID)
+
 	if err != nil {
 		h.metrics.IncSeaweedConnectionFail()
 		h.metrics.IncGetStatsFail(h.bucketName(), fileID)
@@ -210,7 +241,9 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request, fileID string) {
 		return
 	}
 	h.metrics.IncGetStatsSuccess(h.bucketName())
-	writeJSON(w, http.StatusOK, map[string]any{"error": false, "data": meta})
+	writeJSON(w, http.StatusOK, map[string]any{"error": false, "errorCode": 0, "data": map[string]any{"cid": fileID, "tenant_id": meta.TenantID, "deleted": "false", "content_status": "PROCESSED", "mime_type": meta.ContentType, "page_count": "1", "name": fileID + ".pdf"}})
+	//writeJSON(w, http.StatusOK, map[string]any{"error": false, "errorCode": 0, "data": map[string]any{"cid": fileID}})
+	//writeJSON(w, http.StatusOK, map[string]any{"error": false, "data": meta})
 }
 func (h *Handler) getBinary(w http.ResponseWriter, r *http.Request, fileID string) {
 	meta, err := h.readMeta(r.Context(), fileID)
@@ -244,7 +277,111 @@ func (h *Handler) getBinary(w http.ResponseWriter, r *http.Request, fileID strin
 	}
 	_, _ = io.Copy(w, resp.Body)
 }
+
+// func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, fileID string, page int) {
+// 	scale := 1.0
+// 	if v := r.URL.Query().Get("scale"); v != "" {
+// 		if p, err := strconv.ParseFloat(v, 64); err == nil {
+// 			scale = p
+// 		}
+// 	}
+// 	if scale > 2 {
+// 		scale = 2
+// 	}
+// 	if scale <= 0 {
+// 		scale = 1
+// 	}
+// 	meta, err := h.readMeta(r.Context(), fileID)
+// 	if err != nil {
+// 		h.metrics.IncSeaweedConnectionFail()
+// 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
+// 		writeJSON(w, http.StatusNotFound, map[string]any{"error": true, "message": err.Error()})
+// 		return
+// 	}
+// 	if strings.HasPrefix(strings.ToLower(meta.ContentType), "image/") {
+// 		resp, err := h.client.Download(r.Context(), meta.StoragePath)
+// 		if err != nil {
+// 			h.metrics.IncSeaweedConnectionFail()
+// 			h.metrics.IncSeaweedGetStreamFail(h.bucketName(), meta.StoragePath)
+// 			h.metrics.IncFileDownloadFail(h.bucketName(), fileID)
+// 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
+// 			return
+// 		}
+// 		defer resp.Body.Close()
+// 		h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
+// 		h.metrics.IncFileDownloadSuccess(h.bucketName())
+// 		w.Header().Set("Content-Type", meta.ContentType)
+// 		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", fileID+extensionFromContentType(meta.ContentType)))
+// 		if meta.Size > 0 {
+// 			w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
+// 		}
+// 		_, _ = io.Copy(w, resp.Body)
+// 		return
+// 	}
+// 	if !strings.Contains(strings.ToLower(meta.ContentType), "pdf") {
+// 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": true, "message": "preview only supported for PDF or image content"})
+// 		return
+// 	}
+// 	cachePath := h.previewCachePath(fileID, page)
+// 	if resp, err := h.client.Download(r.Context(), cachePath); err == nil {
+// 		defer resp.Body.Close()
+// 		h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
+// 		h.metrics.IncPDFImageSuccess(h.bucketName())
+// 		if size := resp.ContentLength; size > 0 {
+// 			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+// 		}
+// 		w.Header().Set("Content-Type", "image/png")
+// 		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(cachePath)))
+// 		_, _ = io.Copy(w, resp.Body)
+// 		return
+// 	}
+// 	tmpDir, err := os.MkdirTemp(h.cfg.TempDir, "dms-preview-")
+// 	if err != nil {
+// 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": true, "message": err.Error()})
+// 		return
+// 	}
+// 	defer os.RemoveAll(tmpDir)
+// 	pdfPath := filepath.Join(tmpDir, fileID+".pdf")
+// 	if err := h.client.DownloadToFile(r.Context(), meta.StoragePath, pdfPath); err != nil {
+// 		h.metrics.IncSeaweedConnectionFail()
+// 		h.metrics.IncSeaweedGetStreamFail(h.bucketName(), meta.StoragePath)
+// 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
+// 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
+// 		return
+// 	}
+// 	h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
+// 	prefix := filepath.Join(tmpDir, "preview")
+// 	dpi := int(float64(h.cfg.PDFFallbackDPI) * scale)
+// 	cmd := exec.CommandContext(context.Background(), "pdftoppm", "-png", "-f", strconv.Itoa(page), "-singlefile", "-r", strconv.Itoa(dpi), pdfPath, prefix)
+// 	var stderr bytes.Buffer
+// 	cmd.Stderr = &stderr
+// 	if err := cmd.Run(); err != nil {
+// 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
+// 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": strings.TrimSpace(stderr.String())})
+// 		return
+// 	}
+// 	pngPath := prefix + ".png"
+// 	pngBytes, err := os.ReadFile(pngPath)
+// 	if err != nil {
+// 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
+// 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
+// 		return
+// 	}
+// 	h.metrics.IncPDFImageSuccess(h.bucketName())
+// 	go func(cachePath string, payload []byte) {
+// 		_, _ = h.client.UploadBytes(context.Background(), cachePath, "file", path.Base(cachePath), payload)
+// 	}(cachePath, append([]byte(nil), pngBytes...))
+// 	w.Header().Set("Content-Type", "image/png")
+// 	w.Header().Set("Content-Length", strconv.Itoa(len(pngBytes)))
+// 	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(cachePath)))
+// 	_, _ = w.Write(pngBytes)
+// }
+
 func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, fileID string, page int) {
+
+	// =======================
+	// SCALE HANDLING
+	// =======================
 	scale := 1.0
 	if v := r.URL.Query().Get("scale"); v != "" {
 		if p, err := strconv.ParseFloat(v, 64); err == nil {
@@ -257,91 +394,201 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 	if scale <= 0 {
 		scale = 1
 	}
+
+	// =======================
+	// READ META
+	// =======================
 	meta, err := h.readMeta(r.Context(), fileID)
 	if err != nil {
 		h.metrics.IncSeaweedConnectionFail()
 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": true, "message": err.Error()})
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error": true, "message": err.Error(),
+		})
 		return
 	}
-	if strings.HasPrefix(strings.ToLower(meta.ContentType), "image/") {
+
+	// =======================
+	// NORMALIZE TYPE
+	// =======================
+	contentType := strings.ToLower(meta.ContentType)
+
+	fileName := strings.ToLower(meta.Tags["original_filename"])
+	if fileName == "" {
+		fileName = strings.ToLower(fileID + ".pdf") // fallback
+	}
+
+	// detect types
+	isImage := strings.HasPrefix(contentType, "image/") ||
+		strings.HasSuffix(fileName, ".png") ||
+		strings.HasSuffix(fileName, ".jpg") ||
+		strings.HasSuffix(fileName, ".jpeg")
+
+	isPDF := strings.Contains(contentType, "pdf") ||
+		strings.HasSuffix(fileName, ".pdf")
+
+	// fix DSS wrong MIME
+	if contentType == "application/octet-stream" && isPDF {
+		contentType = "application/pdf"
+	}
+
+	// =======================
+	// IMAGE FLOW
+	// =======================
+	if isImage {
 		resp, err := h.client.Download(r.Context(), meta.StoragePath)
 		if err != nil {
 			h.metrics.IncSeaweedConnectionFail()
 			h.metrics.IncSeaweedGetStreamFail(h.bucketName(), meta.StoragePath)
 			h.metrics.IncFileDownloadFail(h.bucketName(), fileID)
-			writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
+
+			writeJSON(w, http.StatusBadGateway, map[string]any{
+				"error": true, "message": err.Error(),
+			})
 			return
 		}
 		defer resp.Body.Close()
+
 		h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
 		h.metrics.IncFileDownloadSuccess(h.bucketName())
-		w.Header().Set("Content-Type", meta.ContentType)
-		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", fileID+extensionFromContentType(meta.ContentType)))
+
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Disposition",
+			fmt.Sprintf("inline; filename=%q",
+				fileID+extensionFromContentType(contentType)))
+
 		if meta.Size > 0 {
-			w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
+			w.Header().Set("Content-Length",
+				strconv.FormatInt(meta.Size, 10))
 		}
+
 		_, _ = io.Copy(w, resp.Body)
 		return
 	}
-	if !strings.Contains(strings.ToLower(meta.ContentType), "pdf") {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": true, "message": "preview only supported for PDF or image content"})
+
+	// =======================
+	// INVALID TYPE
+	// =======================
+	if !isPDF {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":   true,
+			"message": "preview only supported for PDF or image content",
+		})
 		return
 	}
-	cachePath := h.previewCachePath(fileID, page)
+
+	// =======================
+	// CACHE CHECK
+	// =======================
+	dpi := int(float64(h.cfg.PDFFallbackDPI) * scale)
+	cachePath := h.previewCachePath(fileID, page, dpi)
+
 	if resp, err := h.client.Download(r.Context(), cachePath); err == nil {
 		defer resp.Body.Close()
+
 		h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
 		h.metrics.IncPDFImageSuccess(h.bucketName())
+
 		if size := resp.ContentLength; size > 0 {
-			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+			w.Header().Set("Content-Length",
+				strconv.FormatInt(size, 10))
 		}
+
 		w.Header().Set("Content-Type", "image/png")
-		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(cachePath)))
+		w.Header().Set("Content-Disposition",
+			fmt.Sprintf("inline; filename=%q", path.Base(cachePath)))
+
 		_, _ = io.Copy(w, resp.Body)
 		return
 	}
+
+	// =======================
+	// GENERATE PREVIEW
+	// =======================
 	tmpDir, err := os.MkdirTemp(h.cfg.TempDir, "dms-preview-")
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": true, "message": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": true, "message": err.Error(),
+		})
 		return
 	}
 	defer os.RemoveAll(tmpDir)
+
 	pdfPath := filepath.Join(tmpDir, fileID+".pdf")
+
 	if err := h.client.DownloadToFile(r.Context(), meta.StoragePath, pdfPath); err != nil {
 		h.metrics.IncSeaweedConnectionFail()
 		h.metrics.IncSeaweedGetStreamFail(h.bucketName(), meta.StoragePath)
 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
+
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": true, "message": err.Error(),
+		})
 		return
 	}
+
 	h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
+
 	prefix := filepath.Join(tmpDir, "preview")
-	dpi := int(float64(h.cfg.PDFFallbackDPI) * scale)
-	cmd := exec.CommandContext(context.Background(), "pdftoppm", "-png", "-f", strconv.Itoa(page), "-singlefile", "-r", strconv.Itoa(dpi), pdfPath, prefix)
+
+	cmd := exec.CommandContext(
+		r.Context(),
+		"pdftoppm",
+		"-png",
+		"-f", strconv.Itoa(page),
+		"-singlefile",
+		"-r", strconv.Itoa(dpi),
+		pdfPath,
+		prefix,
+	)
+
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+
 	if err := cmd.Run(); err != nil {
 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": strings.TrimSpace(stderr.String())})
+
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error":   true,
+			"message": strings.TrimSpace(stderr.String()),
+		})
 		return
 	}
+
 	pngPath := prefix + ".png"
+
 	pngBytes, err := os.ReadFile(pngPath)
 	if err != nil {
 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
+
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": true, "message": err.Error(),
+		})
 		return
 	}
+
 	h.metrics.IncPDFImageSuccess(h.bucketName())
+
+	// async cache
 	go func(cachePath string, payload []byte) {
-		_, _ = h.client.UploadBytes(context.Background(), cachePath, "file", path.Base(cachePath), payload)
+		_, _ = h.client.UploadBytes(
+			context.Background(),
+			cachePath,
+			"file",
+			path.Base(cachePath),
+			payload,
+		)
 	}(cachePath, append([]byte(nil), pngBytes...))
+
+	// response
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Content-Length", strconv.Itoa(len(pngBytes)))
-	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(cachePath)))
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf("inline; filename=%q", path.Base(cachePath)))
+
 	_, _ = w.Write(pngBytes)
 }
+
 func (h *Handler) readMeta(ctx context.Context, fileID string) (seaweed.FileMeta, error) {
 	var meta seaweed.FileMeta
 	if err := h.client.ReadJSON(ctx, h.metaPath(fileID), &meta); err != nil {
@@ -376,8 +623,8 @@ func (h *Handler) failedBinaryPath(fileID, fileName string) string {
 func (h *Handler) metaPath(fileID string) string {
 	return path.Join(h.cfg.InternalRoot, "meta", fileID+".json")
 }
-func (h *Handler) previewCachePath(fileID string, page int) string {
-	return path.Join(h.cfg.InternalRoot, "images", fmt.Sprintf("%s_page_%d.png", fileID, page))
+func (h *Handler) previewCachePath(fileID string, page, dpi int) string {
+	return path.Join(h.cfg.InternalRoot, "images", fmt.Sprintf("%s_page_%d_dpi_%d.png", fileID, page, dpi))
 }
 func (h *Handler) bucketName() string {
 	return h.cfg.InternalRoot
