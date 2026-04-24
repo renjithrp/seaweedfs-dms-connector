@@ -1,0 +1,17 @@
+# Go build
+bin/
+pkg/
+
+# SeaweedFS runtime data
+seaweedFS/data/
+
+# temp files
+*.save
+
+# scripts (optional backups)
+*.sh.save
+
+# IDE
+.vscode/
+.idea/
+

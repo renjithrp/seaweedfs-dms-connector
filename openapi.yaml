@@ -1,0 +1,65 @@
+openapi: 3.0.0
+info:
+  title: DSS File Download API
+  version: 1.0.0
+  description: API for downloading files from Deep Storage Server (DSS)
+
+servers:
+  - url: http://127.0.0.1:9081
+
+paths:
+  /dss/api/get/{cid}:
+    get:
+      summary: Download file from DSS
+      description: Retrieves a file from DSS using the unique document ID (cid)
+      operationId: downloadFile
+
+      parameters:
+        - name: cid
+          in: path
+          required: true
+          description: Unique document ID generated during upload
+          schema:
+            type: string
+            example: "2045021146255192064"
+
+      responses:
+        '200':
+          description: File downloaded successfully
+          headers:
+            Content-Disposition:
+              description: Indicates file attachment and original filename
+              schema:
+                type: string
+                example: attachment;filename=eDistrict_SNEHA_Receipt_Page.pdf
+            Content-Type:
+              description: MIME type of the file
+              schema:
+                type: string
+                example: application/octet-stream
+
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+
+        '404':
+          description: File not found
+          content:
+            application/json:
+              schema:
+                type: object
+                example:
+                  error: true
+                  message: "File not found"
+
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                type: object
+                example:
+                  error: true
+                  message: "Error retrieving file"
