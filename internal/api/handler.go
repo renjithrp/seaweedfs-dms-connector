@@ -113,6 +113,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/dss/api/get/"):
 		endpoint = "get"
 		h.getBinary(rw, r, strings.TrimPrefix(r.URL.Path, "/dss/api/get/"))
+
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/dss/api/process/"):
+		endpoint = "process"
+
+		fileID := strings.TrimPrefix(r.URL.Path, "/dss/api/process/")
+		h.processFile(rw, r, fileID)
+
 	default:
 		http.NotFound(rw, r)
 	}
@@ -376,6 +383,44 @@ func (h *Handler) getBinary(w http.ResponseWriter, r *http.Request, fileID strin
 // 	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(cachePath)))
 // 	_, _ = w.Write(pngBytes)
 // }
+
+func (h *Handler) processFile(w http.ResponseWriter, r *http.Request, fileID string) {
+
+	// =======================
+	// VALIDATION
+	// =======================
+	if fileID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":     true,
+			"errorCode": 1,
+			"message":   "Invalid file ID",
+		})
+		return
+	}
+
+	// =======================
+	// CHECK FILE EXISTS
+	// =======================
+	_, err := h.readMeta(r.Context(), fileID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error":     true,
+			"errorCode": 2,
+			"message":   "File not found",
+		})
+		return
+	}
+
+	// =======================
+	// PROCESS (NOT IMPLEMENTED)
+	// =======================
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"error":     false,
+		"errorCode": 0,
+		"data":      map[string]any{},
+	})
+}
 
 func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, fileID string, page int) {
 
